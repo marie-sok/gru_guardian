@@ -14,7 +14,8 @@ from monitor import HealthMonitor
 from repair import RepairEngine
 from storage import init_db, add_event, open_incident, resolve_latest_incident, queue_fix, recent_incidents, recent_events, recent_fixes
 
-bot = Bot(settings.telegram_bot_token) if settings.telegram_bot_token else None
+TELEGRAM_TOKEN = os.getenv("GRU_BOT_TG_KEY") or settings.telegram_bot_token
+bot = Bot(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
 dp = Dispatcher()
 monitor = HealthMonitor()
 repair = RepairEngine()
@@ -61,7 +62,8 @@ async def policy(message: Message) -> None:
         f"Mode: {settings.mode}\n"
         f"Auto repair: {'enabled' if settings.can_repair else 'disabled'}\n"
         f"Code changes: {'enabled' if settings.can_code else 'disabled'}\n"
-        f"Production changes: {'enabled' if settings.can_touch_production else 'disabled'}"
+        f"Production changes: {'enabled' if settings.can_touch_production else 'disabled'}\n"
+        f"AI key: {'configured' if settings.ai_key else 'missing'}"
     )
 
 
@@ -145,6 +147,7 @@ async def guardian_health(_: web.Request) -> web.Response:
         "service": "gru.guardian",
         "mode": settings.mode,
         "telegram": "configured" if bot else "awaiting_secret",
+        "ai": "configured" if settings.ai_key else "awaiting_secret",
     })
 
 
