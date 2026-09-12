@@ -14,7 +14,7 @@ from monitor import HealthMonitor
 from repair import RepairEngine
 from storage import init_db, add_event, open_incident, resolve_latest_incident, queue_fix, recent_incidents, recent_events, recent_fixes
 
-bot = Bot(settings.telegram_bot_token)
+bot = Bot(settings.telegram_bot_token) if settings.telegram_bot_token else None
 dp = Dispatcher()
 monitor = HealthMonitor()
 repair = RepairEngine()
@@ -101,7 +101,7 @@ async def fix_request(message: Message) -> None:
     add_event("fix_request", f"#{request_id}: {text}")
     await message.answer(
         f"🧠 Fix request #{request_id} queued.\n"
-        "Guardian will keep it in the private operations log. Code/production changes require an authenticated GitHub integration and your explicit command."
+        "Guardian keeps it in the private operations log. Code/production changes require authenticated GitHub/Render access and your explicit command."
     )
 
 
@@ -124,7 +124,7 @@ async def repair_edge(message: Message) -> None:
 
 
 @dp.message(Command("cabinet"))
-async def cabinet(message: Message) -> None:
+async def cabinet_command(message: Message) -> None:
     if not is_admin(message):
         return
     base = os.getenv("RENDER_EXTERNAL_URL", "")
@@ -140,10 +140,15 @@ def _authorized(request: web.Request) -> bool:
 
 
 async def guardian_health(_: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "service": "gru.guardian", "mode": settings.mode})
+    return web.json_response({
+        "status": "ok",
+        "service": "gru.guardian",
+        "mode": settings.mode,
+        "telegram": "configured" if bot else "awaiting_secret",
+    })
 
 
-async def cabinet(request: web.Request) -> web.Response:
+async def cabinet_page(request: web.Request) -> web.Response:
     if not _authorized(request):
         raise web.HTTPUnauthorized()
     results = await monitor.snapshot()
@@ -161,7 +166,7 @@ async def start_health_server() -> web.AppRunner:
     app = web.Application()
     app.router.add_get("/health", guardian_health)
     app.router.add_get("/", guardian_health)
-    app.router.add_get("/cabinet", cabinet)
+    app.router.add_get("/cabinet", cabinet_page)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", "10000"))
@@ -181,7 +186,7 @@ async def watcher() -> None:
                 if previous is False:
                     resolve_latest_incident(result.target)
                     add_event("recovery", f"{result.target} recovered: HTTP {result.status}, {result.latency_ms} ms")
-                    if settings.telegram_admin_chat_id is not None:
+                    if bot and settings.telegram_admin_chat_id is not None:
                         await bot.send_message(settings.telegram_admin_chat_id, f"🟢 GRU recovery: {result.target} is healthy again. HTTP {result.status} • {result.latency_ms} ms")
                 continue
 
@@ -189,7 +194,7 @@ async def watcher() -> None:
                 detail = f"{result.target} failed {failures} checks in a row; status={result.status}; error={result.error}"
                 incident_id = open_incident(result.target, "critical", detail)
                 add_event("incident", f"#{incident_id}: {detail}")
-                if settings.telegram_admin_chat_id is not None:
+                if bot and settings.telegram_admin_chat_id is not None:
                     await bot.send_message(settings.telegram_admin_chat_id, f"🚨 GRU incident #{incident_id}\n{render_snapshot(results)}")
                     if settings.can_repair:
                         ok, repair_detail = await repair.safe_repair(result.target)
@@ -201,15 +206,20 @@ async def watcher() -> None:
 async def main() -> None:
     init_db()
     add_event("startup", f"Guardian started in {settings.mode} mode")
-    await bot.delete_webhook(drop_pending_updates=False)
     health_runner = await start_health_server()
     watcher_task = asyncio.create_task(watcher())
     try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        if bot:
+            await bot.delete_webhook(drop_pending_updates=False)
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        else:
+            while True:
+                await asyncio.sleep(3600)
     finally:
         watcher_task.cancel()
         await health_runner.cleanup()
-        await bot.session.close()
+        if bot:
+            await bot.session.close()
 
 
 if __name__ == "__main__":
