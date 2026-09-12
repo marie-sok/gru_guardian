@@ -21,10 +21,16 @@ monitor = HealthMonitor()
 repair = RepairEngine()
 last_state: dict[str, bool] = {}
 DASHBOARD_TOKEN = os.getenv("GRU_GUARDIAN_DASHBOARD_TOKEN", "")
+ALLOWED_TELEGRAM_USERNAME = os.getenv("GRU_GUARDIAN_ALLOWED_USERNAME", "sdprncss").lstrip("@").strip().lower()
 
 
 def is_admin(message: Message) -> bool:
-    return bool(settings.telegram_admin_chat_id is not None and message.chat and message.chat.id == settings.telegram_admin_chat_id)
+    """Allow Guardian commands only from the approved Telegram account in a private chat."""
+    if not message.chat or message.chat.type != "private" or not message.from_user:
+        return False
+
+    username = (message.from_user.username or "").strip().lower()
+    return bool(ALLOWED_TELEGRAM_USERNAME and username == ALLOWED_TELEGRAM_USERNAME)
 
 
 def render_snapshot(results) -> str:
@@ -40,12 +46,21 @@ def render_snapshot(results) -> str:
 
 @dp.message(Command("start"))
 async def start(message: Message) -> None:
-    if settings.telegram_admin_chat_id is None:
-        await message.answer(f"gru.guardian bootstrap mode.\nYour chat ID: {message.chat.id}\nSet GRU_GUARDIAN_TELEGRAM_ADMIN_CHAT_ID in Render and redeploy.")
-        return
     if not is_admin(message):
         return
-    await message.answer("gru.guardian online.\n/status /policy /incidents /updates /fix <request> /repair_backend /repair_edge /cabinet")
+
+    admin_hint = ""
+    if settings.telegram_admin_chat_id is None:
+        admin_hint = (
+            f"\n\nAlert delivery is not bound yet. Your chat ID: {message.chat.id}\n"
+            "Set GRU_GUARDIAN_TELEGRAM_ADMIN_CHAT_ID in Render to this value for incident alerts."
+        )
+
+    await message.answer(
+        "gru.guardian online.\n"
+        "/status /policy /incidents /updates /fix <request> /repair_backend /repair_edge /cabinet"
+        + admin_hint
+    )
 
 
 @dp.message(Command("status"))
