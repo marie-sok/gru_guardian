@@ -140,6 +140,14 @@ def queue_fix(text: str) -> int:
         return int(cur.lastrowid)
 
 
+def get_fix(request_id: int) -> tuple | None:
+    with closing(_connect()) as db:
+        return db.execute(
+            _sql("SELECT id, created_at, request_text, status, result FROM fix_requests WHERE id=?"),
+            (request_id,),
+        ).fetchone()
+
+
 def update_fix(request_id: int, status: str, result: str | None = None) -> None:
     with closing(_connect()) as db:
         db.execute(
