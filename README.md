@@ -1,6 +1,6 @@
 # gru.guardian
 
-Private operations companion for GRU.
+Private operations companion for gru.
 
 ## Responsibilities
 
