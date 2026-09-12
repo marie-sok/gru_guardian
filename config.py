@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     recovery_cooldown_seconds: int = 900
     ci_poll_seconds: int = 300
 
+    daily_report_enabled: bool = True
+    daily_report_hour_utc: int = 6
+    weekly_report_enabled: bool = True
+    weekly_report_weekday_utc: int = 0
+
     # Observe | Repair | Code | Production
     mode: str = "Observe"
 
