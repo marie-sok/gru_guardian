@@ -1,3 +1,4 @@
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -5,6 +6,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="GRU_GUARDIAN_", case_sensitive=False)
 
     telegram_bot_token: str | None = None
+    key: str | None = None
     telegram_admin_chat_id: int | None = None
 
     backend_url: str = "https://gru-jiqi.onrender.com"
@@ -26,6 +28,12 @@ class Settings(BaseSettings):
 
     # Observe | Repair | Code | Production
     mode: str = "Observe"
+
+    @model_validator(mode="after")
+    def resolve_telegram_token(self) -> "Settings":
+        if not self.telegram_bot_token and self.key:
+            self.telegram_bot_token = self.key
+        return self
 
     @property
     def can_repair(self) -> bool:
