@@ -19,26 +19,32 @@ Production changes, destructive database actions, secret rotation, branch merges
 If evidence is insufficient, say so clearly.
 """
 
+REWRITE_PROMPT = """You are a cautious senior software engineer modifying exactly one existing source file for GRU.
+Follow the requested change and preserve unrelated behavior.
+Do not add secrets, credentials, telemetry, destructive database operations, hidden backdoors, or changes outside this file.
+Return ONLY the complete replacement file contents, with no markdown fences and no explanation.
+If the requested change cannot be safely implemented in this single file, return exactly: REFUSE_SINGLE_FILE_CHANGE
+"""
+
 
 class AIDoctor:
-    async def diagnose(self, evidence: str) -> tuple[bool, str]:
-        evidence = evidence[:18000]
+    async def _response_text(self, system: str, user: str, max_output_tokens: int) -> tuple[bool, str]:
         if not settings.ai_key:
-            return True, self._fallback(evidence)
+            return False, "AI key is not configured"
 
         payload = {
             "model": settings.ai_model,
             "input": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": evidence},
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
-            "max_output_tokens": 1200,
+            "max_output_tokens": max_output_tokens,
         }
         headers = {
             "Authorization": f"Bearer {settings.ai_key}",
             "Content-Type": "application/json",
         }
-        timeout = aiohttp.ClientTimeout(total=45)
+        timeout = aiohttp.ClientTimeout(total=60)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(
@@ -48,10 +54,10 @@ class AIDoctor:
                 ) as response:
                     raw = await response.text()
                     if response.status >= 300:
-                        return True, self._fallback(evidence, f"AI unavailable: HTTP {response.status}")
+                        return False, f"AI HTTP {response.status}"
                     body = json.loads(raw)
         except Exception as exc:
-            return True, self._fallback(evidence, f"AI unavailable: {type(exc).__name__}")
+            return False, f"AI unavailable: {type(exc).__name__}"
 
         text = body.get("output_text") if isinstance(body, dict) else None
         if not text and isinstance(body, dict):
@@ -65,9 +71,39 @@ class AIDoctor:
                         if isinstance(value, str):
                             parts.append(value)
             text = "\n".join(parts)
-        if not text:
-            return True, self._fallback(evidence, "AI returned no text")
+        return (True, text) if text else (False, "AI returned no text")
+
+    async def diagnose(self, evidence: str) -> tuple[bool, str]:
+        evidence = evidence[:18000]
+        if not settings.ai_key:
+            return True, self._fallback(evidence)
+
+        ok, text = await self._response_text(SYSTEM_PROMPT, evidence, 1200)
+        if not ok:
+            return True, self._fallback(evidence, text)
         return True, text[:3900]
+
+    async def rewrite_file(self, path: str, instruction: str, current_content: str) -> tuple[bool, str]:
+        if not settings.ai_key:
+            return False, "AI key is required for PR code generation"
+        if len(current_content) > 120000:
+            return False, "File is too large for guarded single-file rewrite"
+
+        user = (
+            f"FILE PATH: {path}\n\n"
+            f"REQUEST:\n{instruction[:5000]}\n\n"
+            "CURRENT FILE:\n"
+            f"{current_content}"
+        )
+        ok, text = await self._response_text(REWRITE_PROMPT, user, 16000)
+        if not ok:
+            return False, text
+        text = text.strip()
+        if text == "REFUSE_SINGLE_FILE_CHANGE":
+            return False, "AI refused because the request cannot be safely contained to one file"
+        if not text or text == current_content.strip():
+            return False, "AI produced no effective file change"
+        return True, text
 
     def _fallback(self, evidence: str, note: str | None = None) -> str:
         low = evidence.lower()
