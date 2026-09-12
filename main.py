@@ -4,6 +4,7 @@ import asyncio
 import html
 import os
 import secrets
+from datetime import datetime, timezone
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -14,10 +15,12 @@ from ai_doctor import AIDoctor
 from config import settings
 from github_ops import GitHubOps
 from monitor import HealthMonitor
+from pr_fixer import PRFixer
 from render_ops import RenderOps
 from repair import RepairEngine
 from storage import (
     add_event,
+    get_fix,
     init_db,
     open_incident,
     queue_fix,
@@ -37,6 +40,7 @@ repair = RepairEngine()
 render_ops = RenderOps()
 github_ops = GitHubOps()
 doctor = AIDoctor()
+pr_fixer = PRFixer(doctor)
 last_state: dict[str, bool] = {}
 DASHBOARD_TOKEN = os.getenv("GRU_GUARDIAN_DASHBOARD_TOKEN", "")
 ALLOWED_TELEGRAM_USERNAME = settings.allowed_username.lstrip("@").strip().lower()
@@ -56,11 +60,7 @@ def _telegram_identity_ok(user) -> bool:
 
 
 def is_admin(message: Message) -> bool:
-    return bool(
-        message.chat
-        and message.chat.type == "private"
-        and _telegram_identity_ok(message.from_user)
-    )
+    return bool(message.chat and message.chat.type == "private" and _telegram_identity_ok(message.from_user))
 
 
 def is_admin_callback(query: CallbackQuery) -> bool:
@@ -94,8 +94,7 @@ def repair_keyboard() -> InlineKeyboardMarkup:
 
 async def collect_evidence(include_logs: bool = True) -> str:
     chunks = [render_snapshot(await monitor.snapshot())]
-
-    ok, ci = await github_ops.ci_summary()
+    _, ci = await github_ops.ci_summary()
     chunks.append("\n[CI]\n" + ci)
 
     for target in ("backend", "edge"):
@@ -115,6 +114,25 @@ async def collect_evidence(include_logs: bool = True) -> str:
     failed_jobs = await github_ops.failed_jobs_context()
     chunks.append("\n[FAILED CI CONTEXT]\n" + failed_jobs)
     return "\n".join(chunks)[:18000]
+
+
+async def build_report(label: str = "report") -> str:
+    snapshot = render_snapshot(await monitor.snapshot())
+    _, ci = await github_ops.ci_summary()
+    incidents = recent_incidents(10 if label == "weekly" else 5)
+    events = recent_events(16 if label == "weekly" else 8)
+    lines = [
+        f"📋 GRU Guardian {label}",
+        snapshot,
+        "",
+        ci,
+        "",
+        f"Audit storage: {storage_backend()}",
+        f"Recent incidents: {len(incidents)}",
+    ]
+    for row in events[:10 if label == "weekly" else 6]:
+        lines.append(f"• {row[2]}: {row[3][:180]}")
+    return "\n".join(lines)[:3900]
 
 
 @dp.message(Command("start"))
@@ -137,16 +155,16 @@ async def start(message: Message) -> None:
     await message.answer(
         "gru.guardian online.\n"
         "/status /doctor /ci /deploys /logs [backend|edge] /report\n"
-        "/incidents /updates /fix <request> /policy /lockdown /unlock /cabinet"
+        "/incidents /updates /fix <request> /prfix <path> :: <change>\n"
+        "/policy /lockdown /unlock /cabinet"
         + id_hint
     )
 
 
 @dp.message(Command("status"))
 async def status(message: Message) -> None:
-    if not is_admin(message):
-        return
-    await message.answer(render_snapshot(await monitor.snapshot()))
+    if is_admin(message):
+        await message.answer(render_snapshot(await monitor.snapshot()))
 
 
 @dp.message(Command("doctor"))
@@ -193,24 +211,8 @@ async def logs_command(message: Message) -> None:
 
 @dp.message(Command("report"))
 async def report_command(message: Message) -> None:
-    if not is_admin(message):
-        return
-    snapshot = render_snapshot(await monitor.snapshot())
-    ok, ci = await github_ops.ci_summary()
-    incidents = recent_incidents(5)
-    events = recent_events(8)
-    lines = [
-        "📋 GRU Guardian report",
-        snapshot,
-        "",
-        ci,
-        "",
-        f"Audit storage: {storage_backend()}",
-        f"Recent incidents: {len(incidents)}",
-    ]
-    for row in events[:6]:
-        lines.append(f"• {row[2]}: {row[3][:180]}")
-    await message.answer("\n".join(lines)[:3900])
+    if is_admin(message):
+        await message.answer(await build_report("report"))
 
 
 @dp.message(Command("policy"))
@@ -275,6 +277,32 @@ async def fix_request(message: Message) -> None:
     )
 
 
+@dp.message(Command("prfix"))
+async def prfix_request(message: Message) -> None:
+    if not is_admin(message):
+        return
+    raw = (message.text or "").partition(" ")[2].strip()
+    if "::" not in raw:
+        await message.answer("Usage: /prfix path/to/File.swift :: describe the exact change")
+        return
+    path, instruction = [part.strip() for part in raw.split("::", 1)]
+    if not path or not instruction:
+        await message.answer("Usage: /prfix path/to/File.swift :: describe the exact change")
+        return
+    request_id = queue_fix(f"PRFIX|{path}|{instruction}")
+    update_fix(request_id, "awaiting_approval", "Single-file draft PR requested")
+    add_event("prfix_request", f"#{request_id}: {path}: {instruction[:500]}")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Create draft PR", callback_data=f"prfix:{request_id}")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="noop")],
+    ])
+    await message.answer(
+        f"PR fix #{request_id}\nFile: {path}\nChange: {instruction}\n\n"
+        "This will create a separate branch + DRAFT PR only. No merge or production deploy.",
+        reply_markup=keyboard,
+    )
+
+
 async def _repair_target(target: str) -> tuple[bool, str]:
     if runtime_lockdown:
         return False, "Guardian is in LOCKDOWN; repair actions are disabled"
@@ -313,6 +341,36 @@ async def repair_callback(query: CallbackQuery) -> None:
     await query.answer("Repair requested")
     ok, detail = await _repair_target(target)
     add_event(f"repair_{target}", detail)
+    if query.message:
+        await query.message.answer(("🟢 " if ok else "🟠 ") + detail)
+
+
+@dp.callback_query(F.data.startswith("prfix:"))
+async def prfix_callback(query: CallbackQuery) -> None:
+    if not is_admin_callback(query):
+        await query.answer()
+        return
+    if runtime_lockdown:
+        await query.answer("LOCKDOWN blocks code actions", show_alert=True)
+        return
+    try:
+        request_id = int((query.data or "").partition(":")[2])
+    except ValueError:
+        await query.answer("Invalid request", show_alert=True)
+        return
+    row = get_fix(request_id)
+    if not row or not str(row[2]).startswith("PRFIX|"):
+        await query.answer("Request not found", show_alert=True)
+        return
+    if row[3] != "awaiting_approval":
+        await query.answer(f"Request is {row[3]}", show_alert=True)
+        return
+    _, path, instruction = str(row[2]).split("|", 2)
+    update_fix(request_id, "building_pr", "Owner approved draft PR generation")
+    await query.answer("Building draft PR")
+    ok, detail = await pr_fixer.create_single_file_draft_pr(request_id, path, instruction)
+    update_fix(request_id, "draft_pr_created" if ok else "pr_failed", detail)
+    add_event("prfix_result", f"#{request_id}: {detail}")
     if query.message:
         await query.message.answer(("🟢 " if ok else "🟠 ") + detail)
 
@@ -441,11 +499,36 @@ async def watcher() -> None:
         await asyncio.sleep(settings.poll_seconds)
 
 
+async def report_scheduler() -> None:
+    last_daily: str | None = None
+    last_weekly: str | None = None
+    while True:
+        now = datetime.now(timezone.utc)
+        day_key = now.date().isoformat()
+        week_key = f"{now.isocalendar().year}-W{now.isocalendar().week}"
+        if bot and settings.telegram_admin_chat_id is not None:
+            if settings.daily_report_enabled and now.hour == settings.daily_report_hour_utc and last_daily != day_key:
+                await bot.send_message(settings.telegram_admin_chat_id, await build_report("daily"))
+                add_event("daily_report", day_key)
+                last_daily = day_key
+            if (
+                settings.weekly_report_enabled
+                and now.weekday() == settings.weekly_report_weekday_utc
+                and now.hour == settings.daily_report_hour_utc
+                and last_weekly != week_key
+            ):
+                await bot.send_message(settings.telegram_admin_chat_id, await build_report("weekly"))
+                add_event("weekly_report", week_key)
+                last_weekly = week_key
+        await asyncio.sleep(60)
+
+
 async def main() -> None:
     init_db()
     add_event("startup", f"Guardian started in {settings.mode} mode; storage={storage_backend()}")
     health_runner = await start_health_server()
     watcher_task = asyncio.create_task(watcher())
+    report_task = asyncio.create_task(report_scheduler())
     try:
         if bot:
             await bot.delete_webhook(drop_pending_updates=False)
@@ -455,6 +538,7 @@ async def main() -> None:
                 await asyncio.sleep(3600)
     finally:
         watcher_task.cancel()
+        report_task.cancel()
         await health_runner.cleanup()
         if bot:
             await bot.session.close()
